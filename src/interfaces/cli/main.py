@@ -71,15 +71,22 @@ class TeleDownCLI:
                     self.console.print(f"[red]Error: {str(e)}[/red]")
                     
         finally:
-            await self.telegram_client.client.disconnect()
-            self.console.print("[yellow]Disconnected from Telegram[/yellow]")
-            
+            try:
+                if self.telegram_client.client and self.telegram_client.client.is_connected():
+                    await self.telegram_client.client.disconnect()
+                    self.console.print("[yellow]Disconnected from Telegram[/yellow]")
+            except Exception as e:
+                self.console.print(f"[red]Error during disconnect: {str(e)}[/red]")
+                
     async def _process_channel(self, channel_url: str):
         """Process a channel URL and handle content download"""
         contents = await self.channel_content_usecase.get_channel_content(channel_url)
         if not contents:
             self.console.print("[red]No content found in channel[/red]")
             return
+            
+        # Sort by date in descending order (newest first)
+        contents = sorted(contents, key=lambda x: x.date, reverse=True)
             
         self.console.print(f"\n[green]Found {len(contents)} indexed items[/green]")
         
@@ -112,7 +119,7 @@ class TeleDownCLI:
             try:
                 to_download = self._parse_download_choice(choice, len(contents))
                 for idx in to_download:
-                    content = contents[idx - 1]
+                    content = contents[idx - 1]  # Adjust index to match reversed list
                     if self.download_manager.is_downloaded(content.id):
                         if not Prompt.ask(
                             f"Content {idx} was already downloaded. Download again?",

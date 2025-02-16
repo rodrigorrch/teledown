@@ -1,11 +1,12 @@
 import os
 import re
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from telethon import TelegramClient, errors
-from telethon.tl.types import Channel as TelethonChannel, Chat, Message
+from telethon.tl.types import Channel as TelethonChannel, Chat, Message, PeerChannel, InputPeerChannel
 from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
-from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.channels import JoinChannelRequest, GetFullChannelRequest
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
 
 from ...domain.repositories.telegram_repository import TelegramRepository
 from ...domain.entities.channel import Channel
@@ -16,6 +17,8 @@ class TelegramClientImpl(TelegramRepository):
     def __init__(self, api_id: str, api_hash: str, session_path: str = 'session/telethon'):
         self.client = TelegramClient(session_path, api_id, api_hash)
         self.console = Console()
+        self.current_channel: Optional[TelethonChannel] = None
+        self.current_input_peer: Optional[InputPeerChannel] = None
         
     async def connect(self) -> bool:
         await self.client.start()
@@ -65,16 +68,27 @@ class TelegramClientImpl(TelegramRepository):
                         return None
             
             if isinstance(entity, (TelethonChannel, Chat)):
-                return Channel(
-                    id=entity.id,
-                    title=entity.title,
-                    username=getattr(entity, 'username', None),
-                    is_private=not bool(getattr(entity, 'username', None)),
-                    members_count=getattr(entity, 'participants_count', None),
-                    description=getattr(entity, 'about', None),
-                    joined_date=datetime.now()
-                )
-                
+                # Get full channel info to ensure we have access_hash
+                try:
+                    full = await self.client(GetFullChannelRequest(channel=entity))
+                    if full and hasattr(full, 'full_chat'):
+                        self.current_channel = entity
+                        self.current_input_peer = InputPeerChannel(
+                            channel_id=entity.id,
+                            access_hash=entity.access_hash or 0
+                        )
+                        return Channel(
+                            id=entity.id,
+                            title=entity.title,
+                            username=getattr(entity, 'username', None),
+                            is_private=not bool(getattr(entity, 'username', None)),
+                            members_count=getattr(entity, 'participants_count', None),
+                            description=getattr(entity, 'about', None),
+                            joined_date=datetime.now()
+                        )
+                except Exception as e:
+                    self.console.print(f"[red]Error getting full channel info: {str(e)}[/red]")
+                    
             return None
             
         except Exception as e:
@@ -83,6 +97,19 @@ class TelegramClientImpl(TelegramRepository):
             
     async def get_channel_messages(self, channel: Channel) -> List[IndexedContent]:
         """Get indexed content from channel messages"""
+        if not self.current_input_peer:
+            try:
+                entity = await self.client.get_entity(PeerChannel(channel.id))
+                if isinstance(entity, TelethonChannel):
+                    self.current_channel = entity
+                    self.current_input_peer = InputPeerChannel(
+                        channel_id=entity.id,
+                        access_hash=entity.access_hash or 0
+                    )
+            except Exception as e:
+                self.console.print(f"[red]Error getting channel for messages: {str(e)}[/red]")
+                return []
+            
         indexed_contents = []
         
         try:
@@ -90,7 +117,7 @@ class TelegramClientImpl(TelegramRepository):
             self.console.print("[yellow]Fetching messages from channel...[/yellow]")
             message_count = 0
             
-            async for message in self.client.iter_messages(channel.id, limit=1000):
+            async for message in self.client.iter_messages(self.current_input_peer, limit=1000):
                 message_count += 1
                 if message_count % 100 == 0:
                     self.console.print(f"[yellow]Processed {message_count} messages...[/yellow]")
@@ -113,13 +140,41 @@ class TelegramClientImpl(TelegramRepository):
         
     async def download_content(self, content: IndexedContent, file_path: str) -> bool:
         try:
-            message = await self.client.get_messages(content.id)
-            if message and message.media:
-                await self.client.download_media(message, file_path)
-                return True
-        except Exception:
-            pass
-        return False
+            if not self.current_input_peer:
+                self.console.print("[red]No channel context available[/red]")
+                return False
+                
+            messages = await self.client.get_messages(self.current_input_peer, ids=[content.id])
+            if not messages or not messages[0] or not messages[0].media:
+                self.console.print("[red]Message not found or has no media[/red]")
+                return False
+                
+            message = messages[0]
+            
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TimeRemainingColumn()
+            ) as progress:
+                task = progress.add_task(f"[cyan]Downloading {content.title or f'Content {content.id}'}...", total=100)
+                
+                def progress_callback(current, total):
+                    progress.update(task, completed=(current * 100 / total))
+                
+                await self.client.download_media(message, file_path, progress_callback=progress_callback)
+                
+            return True
+        except Exception as e:
+            self.console.print(f"[red]Error downloading: {str(e)}[/red]")
+            return False
+            
+    def _download_progress(self, current: int, total: int):
+        """Show download progress"""
+        if total:
+            percentage = (current / total) * 100
+            self.console.print(f"\rDownload progress: {percentage:.1f}%", end="")
         
     def _extract_indexed_content(self, message: Message) -> Optional[IndexedContent]:
         """Extract indexed content information from a message"""
