@@ -1,30 +1,26 @@
 #!/bin/bash
 set -e
 
-# Function to wait for Redis
-wait_for_redis() {
-    echo "Waiting for Redis..."
-    while ! redis-cli -h redis ping &>/dev/null; do
-        echo "Redis is unavailable - sleeping"
-        sleep 1
-    done
-    echo "Redis is ready!"
-}
-
-# Function to handle process termination
-handle_term() {
-    echo "Received SIGTERM/SIGINT, forwarding to Python process..."
-    if [ -n "$child" ]; then
-        kill -TERM "$child" 2>/dev/null || true
-    fi
-    exit 0
-}
-
-# Set up signal handlers
-trap handle_term SIGTERM SIGINT
+# Create and set permissions for required directories
+mkdir -p /app/downloads /app/cache /app/session
+chown -R nobody:nogroup /app/downloads /app/cache /app/session
+chmod -R 777 /app/downloads /app/cache /app/session
 
 # Wait for Redis to be ready
-wait_for_redis
+echo "Waiting for Redis..."
+wait-for-it redis:6379 -t 60
+
+if [ $? -ne 0 ]; then
+    echo "Redis failed to start"
+    exit 1
+fi
+
+echo "Redis is ready!"
+
+# Load environment variables if .env exists
+if [ -f .env ]; then
+    export $(cat .env | grep -v '^#' | xargs)
+fi
 
 # Check if we have a TTY
 if [ -t 0 ]; then
