@@ -1,6 +1,19 @@
-redis
+# Required for Redis caching and session management
+redis>=4.5.1
+
+# Required for Telegram API
 telethon==1.28.5
+
+# Required for progress bars and console output
 tqdm==4.65.0
-python-dotenv==1.0.0
-pydantic==2.0.3
-rich==13.4.2
+rich>=13.4.2
+
+# Required for environment variables
+python-dotenv>=1.0.0
+
+# Required for data validation
+pydantic>=2.0.3
+
+# Required for async operations
+aiohttp>=3.8.0
+async-timeout>=4.0.0

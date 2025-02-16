@@ -5,10 +5,11 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 
 class CacheManager:
-    def __init__(self, cache_dir: str = "cache"):
+    def __init__(self, cache_dir: str = "cache", ttl_hours: int = 8):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
         self.channel_cache_file = self.cache_dir / "channels.json"
+        self.ttl = timedelta(hours=ttl_hours)
         self.channels: Dict[str, Any] = self._load_channels()
         
     def _load_channels(self) -> Dict[str, Any]:
@@ -33,9 +34,9 @@ class CacheManager:
         """Get channel from cache if not expired"""
         if channel_id in self.channels:
             channel_data = self.channels[channel_id]
-            # Check if cache is still valid (24 hours)
+            # Check if cache is still valid using configured TTL
             cached_time = datetime.fromisoformat(channel_data['cached_at'])
-            if datetime.now() - cached_time < timedelta(hours=24):
+            if datetime.now() - cached_time < self.ttl:
                 return channel_data['data']
             else:
                 # Remove expired cache

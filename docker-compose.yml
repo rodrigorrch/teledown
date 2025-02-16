@@ -7,11 +7,13 @@ services:
       - ./session:/app/session
     env_file:
       - .env
-    stdin_open: true  # Permite entrada interativa
-    tty: true        # Aloca um pseudo-TTY
+    stdin_open: true  # Docker -i
+    tty: true        # Docker -t
     depends_on:
-      - redis
-    restart: unless-stopped
+      redis:
+        condition: service_healthy
+    restart: "no"     # Changed from unless-stopped to prevent auto-restart loop
+    init: true       # Add proper init process handling
 
   redis:
     image: redis:alpine
@@ -20,6 +22,11 @@ services:
     volumes:
       - redis_data:/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
 volumes:
   redis_data:

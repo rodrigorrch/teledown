@@ -1,54 +1,122 @@
 import os
 import json
+import sys
+import signal
+import asyncio
+import redis
+import re
 from datetime import datetime
+from pathlib import Path
+from typing import Optional, Dict, Any
+
 from telethon import TelegramClient, errors
 from telethon.tl.types import (
     MessageMediaDocument, 
     DocumentAttributeVideo,
     MessageMediaWebPage,
-    WebPage,
     Channel, 
-    User, 
     Message,
     Chat,
     MessageEntityUrl,
-    MessageEntityTextUrl,
-    InputPeerChannel,
-    InputChannel
+    MessageEntityTextUrl
 )
-from telethon.tl.functions.messages import GetHistoryRequest, ImportChatInviteRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.functions.channels import JoinChannelRequest
+
 from rich.console import Console
-from rich.prompt import Prompt, Confirm
-from rich import print as rprint
+from rich.prompt import Prompt
 from tqdm import tqdm
-from pathlib import Path
+from dotenv import load_dotenv
+
 from download_manager import DownloadManager
 from cache_manager import CacheManager
-import re
 
+# Initialize console
 console = Console()
 
-# Telegram API credentials from environment variables
+# Load environment variables
+load_dotenv()
+
+# Get Telegram API credentials
 API_ID = os.getenv('API_ID')
 API_HASH = os.getenv('API_HASH')
+
+if not API_ID or not API_HASH:
+    console.print("[red]Error: API_ID and API_HASH must be set in .env file[/red]")
+    sys.exit(1)
 
 class TeleDown:
     def __init__(self):
         self.client = TelegramClient('session/telethon', API_ID, API_HASH)
         self.download_manager = DownloadManager()
         self.cache_manager = CacheManager(cache_dir="cache")
+        self.redis = None
         
-        # Ensure cache directory exists
+        # Ensure directories exist
         os.makedirs("cache", exist_ok=True)
+        os.makedirs("session", exist_ok=True)
+        
+    async def connect_redis(self, max_attempts=30):
+        """Try to connect to Redis with retries"""
+        attempt = 0
+        while attempt < max_attempts:
+            try:
+                console.print(f"[yellow]Connecting to Redis (attempt {attempt + 1}/{max_attempts})...[/yellow]")
+                self.redis = redis.Redis(host='redis', port=6379, db=0, socket_connect_timeout=5)
+                self.redis.ping()  # Test connection
+                console.print("[green]Connected to Redis![/green]")
+                return True
+            except Exception as e:
+                attempt += 1
+                if attempt < max_attempts:
+                    wait_time = min(2 ** attempt, 30)  # Cap at 30 seconds
+                    console.print(f"[yellow]Redis connection failed, retrying in {wait_time} seconds...[/yellow]")
+                    await asyncio.sleep(wait_time)
+                else:
+                    console.print(f"[yellow]Warning: Redis connection failed after {max_attempts} attempts.[/yellow]")
+                    self.redis = None
+                    return False
         
     async def start(self):
+        """Start the Telegram client and handle authentication"""
+        # First try to connect to Redis
+        await self.connect_redis()
+        
+        # Then start Telegram client
         await self.client.start()
+        
         if not await self.client.is_user_authorized():
-            phone = Prompt.ask("Please enter your phone number (with country code)")
-            await self.client.send_code_request(phone)
-            code = Prompt.ask("Please enter the code you received")
-            await self.client.sign_in(phone, code)
+            # Try to get phone from Redis first
+            if self.redis:
+                try:
+                    stored_phone = self.redis.get('user_phone')
+                    if stored_phone:
+                        phone = stored_phone.decode('utf-8')
+                        console.print(f"[blue]Using stored phone number: {phone}[/blue]")
+                except Exception:
+                    phone = None
+            
+            if not phone:
+                phone = Prompt.ask("[bold]Please enter your phone number[/bold] (with country code)")
+                if self.redis:
+                    try:
+                        self.redis.set('user_phone', phone)
+                    except Exception:
+                        pass
+            
+            try:
+                await self.client.send_code_request(phone)
+                code = Prompt.ask("[bold]Please enter the code you received[/bold]")
+                await self.client.sign_in(phone, code)
+                console.print("[green]Successfully logged in![/green]")
+            except Exception as e:
+                console.print(f"[red]Login failed: {str(e)}[/red]")
+                if self.redis:
+                    try:
+                        self.redis.delete('user_phone')  # Clear stored phone on error
+                    except Exception:
+                        pass
+                raise
     
     async def get_channel_messages(self, channel_url):
         try:
@@ -90,95 +158,216 @@ class TeleDown:
 
             # Try to get pinned messages
             try:
-                # Get pinned messages using search parameter
                 pinned_messages = []
-                async for msg in self.client.iter_messages(channel, search='', pinned=True):
-                    if isinstance(msg, Message):
-                        pinned_messages.append(msg)
-                        
+                
+                # Try different methods to get pinned messages
+                try:
+                    # First try: Search for common pin emojis and keywords
+                    pin_searches = ['📌', '📍', 'fixado', 'pinned']
+                    for search_term in pin_searches:
+                        async for message in self.client.iter_messages(channel, search=search_term, limit=10):
+                            if message and message.message and message not in pinned_messages:
+                                pinned_messages.append(message)
+                except:
+                    pass
+                
+                # Second try: Check recent messages
+                if not pinned_messages:
+                    async for message in self.client.iter_messages(channel, limit=30):
+                        try:
+                            if not message or not message.message:
+                                continue
+                                
+                            msg_lower = message.message.lower()
+                            
+                            # Check for common pin indicators in the first line
+                            first_line = msg_lower.split('\n')[0]
+                            if any(indicator in first_line for indicator in 
+                                ['📌', '📍', 'fixado', 'pinned', 'pin:', 'fixo', 'importante', 'important']):
+                                pinned_messages.append(message)
+                                
+                        except Exception:
+                            continue
+                
                 if pinned_messages:
-                    console.print(f"[blue]Encontradas {len(pinned_messages)} mensagens fixadas[/blue]")
+                    console.print(f"\n[blue]Encontradas {len(pinned_messages)} mensagens importantes[/blue]")
                     for msg in pinned_messages:
                         if msg.message:
-                            console.print(f"[cyan]Mensagem fixada: {msg.message[:100]}...[/cyan]")
+                            # Get the first line for display
+                            first_line = msg.message.split('\n')[0]
+                            console.print(f"[cyan]Mensagem: {first_line}[/cyan]")
+                            
+                            # Extract and process content
                             content_info = self._extract_indexed_content(msg)
                             if content_info:
                                 indexed_content.append(content_info)
+                else:
+                    console.print("[yellow]Nenhuma mensagem importante encontrada[/yellow]")
                                 
             except Exception as e:
-                console.print(f"[red]Erro ao verificar mensagens fixadas: {str(e)}[/red]")
+                console.print(f"[red]Erro ao verificar mensagens importantes: {str(e)}[/red]")
+                
+            # Get channel description if available
+            try:
+                if hasattr(channel, 'about') and channel.about:
+                    # Process description for indexed content
+                    desc_msg = type('Message', (), {
+                        'message': channel.about,
+                        'id': 0,
+                        'date': datetime.now(),
+                        'entities': []
+                    })
+                    content_info = self._extract_indexed_content(desc_msg)
+                    if content_info:
+                        indexed_content.append(content_info)
+            except Exception as e:
+                console.print(f"[red]Erro ao processar descrição do canal: {str(e)}[/red]")
 
-            # Display indexed content if found
+            # Display found content with improved list view
             if indexed_content:
-                console.print("\n[green]Conteúdo indexado encontrado:[/green]")
-                for info in indexed_content:
-                    console.print("\n[cyan]" + "-" * 50 + "[/cyan]")
-                    if info.get('title'):
-                        console.print(f"[bold]{info['title']}[/bold]")
+                console.print("\n[green]═══════ Conteúdo Encontrado ═══════[/green]")
+                
+                # Track available downloads
+                available_downloads = []
+                
+                # Show items in list format
+                for i, info in enumerate(indexed_content, 1):
+                    # Format title/name
+                    title = info.get('title', 'Sem título')
+                    title = title[:60] + '...' if len(title) > 60 else title
+                    
+                    # Format metadata
+                    meta = []
                     if info.get('size'):
-                        console.print(f"[yellow]Tamanho: {info['size']}[/yellow]")
+                        meta.append(f"📦 {info['size']}")
                     if info.get('duration'):
-                        console.print(f"[yellow]Duração: {info['duration']}[/yellow]")
+                        meta.append(f"⏱️ {info['duration']}")
                     if info.get('indexed_by'):
-                        console.print(f"[yellow]Indexado por: @{info['indexed_by']}[/yellow]")
-                    if info.get('text'):
-                        console.print(f"\n{info['text']}")
+                        meta.append(f"📑 @{info['indexed_by']}")
+                    
+                    metadata = " | ".join(meta) if meta else ""
+                    
+                    # Check download status
+                    msg_id = info.get('id')
+                    download_status = ""
+                    if msg_id:
+                        for msg in messages:
+                            if msg.id == msg_id and msg.media:
+                                is_downloaded = self.download_manager.is_downloaded(msg.id)
+                                if is_downloaded:
+                                    download_status = "[blue]↺[/blue]"
+                                else:
+                                    download_status = "[green]↓[/green]"
+                                available_downloads.append((i, msg, title, is_downloaded))
+                                break
+                    
+                    # Print item in list format
+                    console.print(f"{download_status} [{i}] {title}")
+                    if metadata:
+                        console.print(f"    {metadata}")
+                
+                # If we have available downloads, show download options
+                if available_downloads:
+                    console.print("\n[bold white]═══════ Downloads ═══════[/bold white]")
+                    console.print("[yellow]Opções de download:[/yellow]")
+                    console.print("• Número específico: [cyan]1[/cyan]")
+                    console.print("• Lista de números: [cyan]1,3,5[/cyan]")
+                    console.print("• Intervalo: [cyan]1-4[/cyan]")
+                    console.print("• Sair: [cyan]0[/cyan]")
+                    console.print("\n[dim]↓ = Novo | ↺ = Disponível para re-download[/dim]")
+                    
+                    while True:
+                        choice = Prompt.ask(
+                            "\n[bold]O que deseja baixar?[/bold]",
+                            default="0"
+                        )
+                        
+                        if choice.lower() == "0":
+                            break
+                            
+                        try:
+                            # Handle ranges like "1-3" or comma-separated numbers "1,2,3"
+                            if "-" in choice:
+                                start, end = map(int, choice.split("-"))
+                                to_download = [i for i, _, _, _ in available_downloads if start <= i <= end]
+                            elif "," in choice:
+                                to_download = [int(x.strip()) for x in choice.split(",")]
+                            else:
+                                to_download = [int(choice)]
+                                
+                            # Download selected items
+                            for item_num in to_download:
+                                for i, msg, title, is_downloaded in available_downloads:
+                                    if i == item_num:
+                                        # If already downloaded, confirm re-download
+                                        if is_downloaded:
+                                            if not Prompt.ask(
+                                                f"Item {i} já foi baixado. Deseja baixar novamente?", 
+                                                choices=["s", "n"], 
+                                                default="n"
+                                            ) == "s":
+                                                continue
+                                        
+                                        # Use title in filename if available
+                                        filename = None
+                                        if title:
+                                            # Clean up title for filename
+                                            clean_title = "".join(c for c in title if c.isalnum() or c in " -_")
+                                            filename = f"{msg.id}_{clean_title[:50]}.mp4"
+                                            
+                                        success, result = await self.download_manager.download_media(
+                                            self.client, msg, filename=filename
+                                        )
+                                        if success:
+                                            console.print(f"[green]✓ Download concluído: {result}[/green]")
+                                        else:
+                                            console.print(f"[red]Erro ao baixar: {result}[/red]")
+                            
+                            # Ask if want to download more
+                            if not Prompt.ask("Deseja baixar mais?", choices=["s", "n"], default="n") == "s":
+                                break
+                                
+                        except ValueError:
+                            console.print("[red]Entrada inválida. Use números, ranges (1-3) ou listas (1,2,3)[/red]")
+                            continue
+                    
             else:
                 console.print("[yellow]Nenhum conteúdo indexado encontrado.[/yellow]")
 
-            # Process messages for media content
-            processed_messages = []
-            with console.status(f"[yellow]Processando {total_messages} mensagens...") as status:
-                for i, message in enumerate(messages):
-                    if not isinstance(message, Message):
-                        continue
-                        
-                    status.update(f"[yellow]Processando mensagens... {i+1}/{total_messages} ({((i+1)/total_messages*100):.1f}%)")
-                    
-                    try:
-                        media_info = self._process_message_media(message)
-                        if media_info:
-                            processed_messages.append(media_info)
-                            type_str = f" [{media_info['type']}]" if media_info.get('type') else ""
-                            console.print(f"[green]✓ Conteúdo encontrado{type_str}: {media_info['title']}[/green]")
-                    except Exception as e:
-                        console.print(f"[red]Erro ao processar mensagem {message.id}: {str(e)}[/red]")
-                        continue
-
-            return sorted(processed_messages, key=lambda x: x['date'], reverse=True)
+            return indexed_content
 
         except Exception as e:
-            console.print(f"[red]Erro ao processar canal: {str(e)}[/red]")
+            console.print(f"[red]Erro ao acessar o canal: {str(e)}[/red]")
             return []
 
     async def _get_channel(self, channel_url):
         """Helper method to get and cache channel information"""
         try:
-            # For private channels with invite links
-            if 't.me/+' in channel_url or 't.me/joinchat/' in channel_url:
-                # Extract invite hash from URL format
+            # Check for different types of channel URLs
+            if '+' in channel_url or 'joinchat' in channel_url:
+                # Extract invite hash from different URL formats
                 invite_hash = None
                 if '/+' in channel_url:
                     invite_hash = channel_url.split('/+')[-1].split('/')[0].strip()
                 elif '/joinchat/' in channel_url:
                     invite_hash = channel_url.split('/joinchat/')[-1].split('/')[0].strip()
-
+                
                 if not invite_hash:
                     console.print("[red]Link de convite inválido[/red]")
                     return None
-
-                console.print(f"[yellow]Tentando acessar canal privado com convite...[/yellow]")
+                    
+                console.print(f"\n[yellow]Tentando acessar canal privado com convite...[/yellow]")
                 
                 try:
-                    # First try to get entity directly in case we're already a member
+                    # First try to get channel if already a member
                     try:
                         channel = await self.client.get_entity(channel_url)
                         console.print("[green]✓ Canal já acessado anteriormente![/green]")
                         return channel
                     except:
                         pass
-
-                    # If not already a member, try to join
+                        
+                    # Try to join using invite
                     updates = await self.client(ImportChatInviteRequest(invite_hash))
                     if updates and hasattr(updates, 'chats') and updates.chats:
                         channel = updates.chats[0]
@@ -196,21 +385,22 @@ class TeleDown:
                     else:
                         console.print(f"[red]Erro ao entrar no canal: {str(e)}[/red]")
                     return None
-
-            # For public channels
+                    
             else:
-                # Remove any URL components and get just the username
+                # Handle regular channel username/URL
                 channel_id = channel_url.split('/')[-1].replace('@', '').strip()
-                if channel_id.startswith('+'):
-                    console.print("[red]Link de convite inválido. Use o formato completo t.me/+HASH[/red]")
+                if not channel_id:
+                    console.print("[red]Username ou URL do canal inválido[/red]")
                     return None
                     
                 console.print(f"\n[yellow]Buscando canal: @{channel_id}[/yellow]")
                 
                 try:
+                    # Try to get channel directly first
                     channel = await self.client.get_entity(f"@{channel_id}")
                 except ValueError:
                     try:
+                        # Try joining if not found
                         await self.client(JoinChannelRequest(f"@{channel_id}"))
                         channel = await self.client.get_entity(f"@{channel_id}")
                     except Exception as e:
@@ -244,30 +434,32 @@ class TeleDown:
             return None
 
     def _extract_indexed_content(self, message):
-        """Helper method to extract indexed content information from a message"""
-        if not message.message:
-            return None
-            
-        msg_lines = message.message.split('\n')
-        content_info = None
-        
-        # Check for message entities (URLs, mentions, etc)
-        if message.entities:
-            for entity in message.entities:
-                if isinstance(entity, (MessageEntityUrl, MessageEntityTextUrl)):
-                    url = entity.url if hasattr(entity, 'url') else message.message[entity.offset:entity.offset + entity.length]
-                    if 't.me/' in url:
-                        channel_username = url.split('t.me/')[-1].split('/')[0].strip()
-                        if not content_info:
-                            content_info = {
-                                'text': message.message,
-                                'indexed_by': channel_username.replace('@', '')
-                            }
+        """Extract indexed content information from a message"""
+        try:
+            if not message or not hasattr(message, 'message') or not message.message:
+                return None
 
-        for line in msg_lines:
-            line_lower = line.lower()
+            # Ensure message content is a string
+            msg_text = str(message.message)
+            msg_lower = msg_text.lower()
+            msg_lines = [line for line in msg_text.split('\n') if line and isinstance(line, str)]
+
+            if not msg_lines:
+                return None
+
+            content_info = None
+
+            # Get message date safely
+            msg_date = getattr(message, 'date', datetime.now()).strftime('%Y-%m-%d %H:%M:%S') if hasattr(message, 'date') else datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             
-            # Extended indexing patterns
+            # Basic message info
+            base_info = {
+                'text': msg_text,
+                'id': getattr(message, 'id', 0),
+                'date': msg_date
+            }
+
+            # Look for indexing patterns first
             indexing_patterns = [
                 r'(?:indexado\s+por|indexed\s+by)\s*@?(\w+)',
                 r'(?:disponível\s+em|available\s+at)\s*@?(\w+)',
@@ -278,222 +470,146 @@ class TeleDown:
                 r'(?:grupo|group)\s*[:-]?\s*@?(\w+)',
                 r'fonte|source\s*[:-]?\s*@?(\w+)'
             ]
-            
-            for pattern in indexing_patterns:
-                indexing_match = re.search(pattern, line, re.IGNORECASE)
-                if indexing_match and not content_info:
-                    username = indexing_match.group(1).strip('@')
-                    # Ignore common false positives
-                    if username.lower() not in ['telegram', 'me', 'bot', 'share']:
-                        content_info = {
-                            'text': message.message,
-                            'indexed_by': username
-                        }
-                        break
-            
-            # Look for size and duration info
-            size_match = re.search(r'(?:tamanho|size):\s*(\d+(?:\.\d+)?)\s*(gb|mb|tb)', line_lower)
-            duration_match = re.search(r'(?:duração|duration):\s*(\d+)\s*h\s*(?:(\d+)\s*min)?', line_lower)
-            
-            if size_match:
-                if not content_info:
-                    content_info = {'text': message.message}
-                size_num = float(size_match.group(1))
-                size_unit = size_match.group(2).lower()
-                content_info['size'] = f"{size_num} {size_unit}"
-            
-            if duration_match:
-                if not content_info:
-                    content_info = {'text': message.message}
-                hours = int(duration_match.group(1))
-                minutes = int(duration_match.group(2)) if duration_match.group(2) else 0
-                content_info['duration'] = f"{hours}h {minutes}min"
-            
-        return content_info if content_info and (content_info.get('indexed_by') or 
-                                               (content_info.get('size') and content_info.get('duration'))) else None
 
-    def _process_message_media(self, message):
-        """Helper method to process media content from a message"""
-        if not isinstance(message, Message):
-            return None
+            # Look for metadata patterns
+            size_pattern = r'(?:tamanho|size):\s*(\d+(?:\.\d+)?)\s*(gb|mb|tb)'
+            duration_pattern = r'(?:duração|duration):\s*(\d+)\s*h\s*(?:(\d+)\s*min)?'
             
-        is_media = False
-        media_url = None
-        file_size = 0
-        duration = None
-        file_name = None
-        media_type = None
-        
-        try:
-            if message.media:
-                if isinstance(message.media, MessageMediaDocument):
-                    is_media = True
-                    if hasattr(message.media.document, 'size'):
-                        file_size = message.media.document.size
+            # Initialize content with base info if we find relevant information
+            for line in msg_lines:
+                if not isinstance(line, str):
+                    continue
                     
-                    for attr in message.media.document.attributes:
-                        if hasattr(attr, 'file_name') and attr.file_name:
-                            file_name = attr.file_name
-                        if isinstance(attr, DocumentAttributeVideo):
-                            duration = attr.duration
-                            media_type = 'video'
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                line_lower = line.lower()
+                
+                # Check for indexing references
+                for pattern in indexing_patterns:
+                    indexing_match = re.search(pattern, line, re.IGNORECASE)
+                    if indexing_match and indexing_match.group(1):
+                        username = indexing_match.group(1).strip('@')
+                        # Ignore common false positives
+                        if username.lower() not in ['telegram', 'me', 'bot', 'share']:
+                            if not content_info:
+                                content_info = base_info.copy()
+                                content_info['indexed_by'] = username
                             break
-                    
-                    if hasattr(message.media.document, 'mime_type'):
-                        mime = message.media.document.mime_type.lower()
-                        if not media_type:  # Only set if not already set by attributes
-                            if 'video' in mime:
-                                media_type = 'video'
-                            elif 'audio' in mime:
-                                media_type = 'audio'
-                            elif 'pdf' in mime:
-                                media_type = 'pdf'
-                            elif any(t in mime for t in ['zip', 'rar', 'x-compressed']):
-                                media_type = 'archive'
+
+                # Look for size information
+                size_match = re.search(size_pattern, line_lower)
+                if size_match and size_match.group(1) and size_match.group(2):
+                    if not content_info:
+                        content_info = base_info.copy()
+                    try:
+                        size_num = float(size_match.group(1))
+                        size_unit = size_match.group(2).lower()
+                        content_info['size'] = f"{size_num} {size_unit}"
+                    except (ValueError, TypeError):
+                        pass
                 
-                elif isinstance(message.media, MessageMediaWebPage) and message.media.webpage:
-                    if message.media.webpage.url:
-                        media_url = message.media.webpage.url
-                        if any(domain in media_url.lower() for domain in [
-                            'youtube.com', 'youtu.be', 'vimeo.com', 'drive.google.com',
-                            'mega.nz', 'mediafire.com', 'dropbox.com'
-                        ]):
-                            is_media = True
-                            media_type = 'external_link'
-
-            if message.message:
-                # Check for course content patterns
-                if any(pattern in message.message.lower() for pattern in [
-                    'módulo', 'aula', 'parte', 'class', 'curso', 'lição'
-                ]):
-                    is_media = True
-                    if not media_type:
-                        media_type = 'course_content'
-
-            if is_media:
-                title = message.message or file_name or f"Media {message.id}"
-                title = title.split('\n')[0] if '\n' in title else title
-                title = title[:100] + '...' if len(title) > 100 else title
+                # Look for duration information
+                duration_match = re.search(duration_pattern, line_lower)
+                if duration_match and duration_match.group(1):
+                    if not content_info:
+                        content_info = base_info.copy()
+                    try:
+                        hours = int(duration_match.group(1))
+                        minutes = int(duration_match.group(2)) if duration_match.group(2) else 0
+                        content_info['duration'] = f"{hours}h {minutes}min"
+                    except (ValueError, TypeError):
+                        pass
                 
-                return {
-                    'id': message.id,
-                    'date': message.date.strftime('%Y-%m-%d %H:%M:%S'),
-                    'title': title,
-                    'size': file_size,
-                    'duration': duration,
-                    'url': media_url,
-                    'file_name': file_name,
-                    'type': media_type,
-                    'downloaded': self.download_manager.is_downloaded(message.id),
-                    'forwarded': bool(message.forward)
-                }
-        
+                # Try to identify a title from the first non-empty line
+                # that's not a metadata line
+                if not content_info:
+                    if not any(keyword in line_lower 
+                           for keyword in ['tamanho:', 'size:', 'duração:', 'duration:', 'indexado', 'indexed']):
+                        content_info = base_info.copy()
+                        content_info['title'] = line
+
+            return content_info
+
         except Exception as e:
-            console.print(f"[red]Erro ao processar mídia da mensagem {message.id}: {str(e)}[/red]")
-        
-        return None
+            console.print(f"[red]Erro ao processar mensagem: {str(e)}[/red]")
+            return None
 
-    async def download_video(self, channel_url, message_id):
-        try:
-            message = await self.client.get_messages(channel_url, ids=message_id)
-            if not message or not message.media:
-                return False
-
-            file_path = f"downloads/{message_id}.mp4"
-            
-            # ...existing code...
-            # Create progress bar
-            progress = tqdm(total=message.media.document.size, 
-                          unit='B', unit_scale=True)
-
-            # ...existing code...
-            # Download callback
-            async def callback(current, total):
-                progress.n = current
-                progress.refresh()
-
-            await self.client.download_media(
-                message,
-                file=file_path,
-                progress_callback=callback
-            )
-            progress.close()
-            
-            self.download_manager.mark_as_downloaded(message_id)
-            return True
-            
-        except Exception as e:
-            console.print(f"[red]Error downloading video {message_id}: {str(e)}[/red]")
-            return False
-
-    @staticmethod
-    def format_size(size_bytes):
-        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-            if size_bytes < 1024.0:
-                return f"{size_bytes:.1f} {unit}"
-            size_bytes /= 1024.0
-        return f"{size_bytes:.1f} TB"
-    
-    @staticmethod
-    def format_duration(seconds):
-        if not seconds:
-            return "N/A"
-        hours = seconds // 3600
-        minutes = (seconds % 3600) // 60
-        return f"{hours}h {minutes}m"
+def signal_handler(sig, frame):
+    """Handle termination signals"""
+    console.print("\n[yellow]Shutting down gracefully...[/yellow]")
+    # Force exit since we're in a container
+    os._exit(0)
 
 async def main():
     try:
+        # Set up signal handlers for container environment
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGHUP, signal_handler)
+        
         teledown = TeleDown()
         await teledown.start()
-
-        channel_url = Prompt.ask("\nEnter channel URL or username")
-        messages = await teledown.get_channel_messages(channel_url)
-
-        if not messages:
-            console.print("[yellow]No content found[/yellow]")
-            return
-
-        # ...existing code...
-        # Group messages by type
-        messages_by_type = {}
-        for msg in messages:
-            msg_type = msg.get('type', 'unknown')
-            if msg_type not in messages_by_type:
-                messages_by_type[msg_type] = []
-            messages_by_type[msg_type].append(msg)
-
-        # ...existing code...
-        # Display content by type
-        console.print("\n[bold cyan]Found content:[/bold cyan]")
-        for content_type, type_messages in messages_by_type.items():
-            console.print(f"\n[bold]{content_type.upper()}[/bold] ({len(type_messages)} items):")
-            for msg in type_messages:
-                status = "[green]✓[/green]" if msg['downloaded'] else "[yellow]□[/yellow]"
-                size_str = TeleDown.format_size(msg['size']) if msg['size'] else "N/A"
-                duration_str = TeleDown.format_duration(msg['duration']) if msg['duration'] else ""
-                duration_display = f" - {duration_str}" if duration_str else ""
-                url_display = f" [link]" if msg.get('url') else ""
+        console.print("[green]Connected to Telegram![/green]")
+        
+        while True:
+            try:
+                sys.stdout.write("\nEnter channel URL or @username (or 'exit' to quit): ")
+                sys.stdout.flush()
                 
-                console.print(f"{status} [{msg['id']}] {msg['title']} ({size_str}{duration_display}){url_display}")
-        
-        # ...existing code...
-        # Select content to download
-        content_ids = Prompt.ask("\nEnter content IDs to download (comma-separated)")
-        content_ids = [int(cid.strip()) for cid in content_ids.split(',') if cid.strip()]
-        
-        for content_id in content_ids:
-            if not teledown.download_manager.is_downloaded(content_id):
-                console.print(f"\n[yellow]Downloading content {content_id}...[/yellow]")
-                success = await teledown.download_video(channel_url, content_id)
-                if success:
-                    console.print(f"[green]Successfully downloaded content {content_id}[/green]")
-            else:
-                console.print(f"[blue]Content {content_id} already downloaded[/blue]")
+                channel_url = sys.stdin.readline()
+                if not channel_url:  # EOF received
+                    break
+                    
+                channel_url = channel_url.strip()
+                if not channel_url:  # Empty input
+                    continue
+                    
+                if channel_url.lower() == 'exit':
+                    break
+                    
+                await teledown.get_channel_messages(channel_url)
+                
+            except (EOFError, KeyboardInterrupt):
+                break
+            except Exception as e:
+                console.print(f"[red]Error: {str(e)}[/red]")
+                continue
                 
     except Exception as e:
-        console.print(f"[red]Error: {str(e)}[/red]")
+        console.print(f"[red]Fatal error: {str(e)}[/red]")
+    finally:
+        if hasattr(teledown, 'client'):
+            await teledown.client.disconnect()
+        console.print("[yellow]Disconnected from Telegram[/yellow]")
+        # Ensure clean exit in container
+        os._exit(0)
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    try:
+        # Set event loop policy for better Windows compatibility
+        if sys.platform == 'win32':
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
+        # Create and run event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            loop.run_until_complete(main())
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Program terminated by user[/yellow]")
+        except Exception as e:
+            console.print(f"[red]Fatal error: {str(e)}[/red]")
+        finally:
+            try:
+                loop.close()
+            except:
+                pass
+            # Ensure clean exit
+            os._exit(0)
+            
+    except Exception as e:
+        console.print(f"[red]Event loop error: {str(e)}[/red]")
+        sys.exit(1)
