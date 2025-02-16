@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Telegram Session
+session/
+*.session
+*.session-journal
+
+# Environment variables
+.env
+!.env.example
+
+# Downloads folder (where videos are saved)
+downloads/
+
+# Docker
+.docker/
+*.log
+
+# OS specific
+.DS_Store
+Thumbs.db

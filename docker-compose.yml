@@ -1,0 +1,12 @@
+services:
+  teledown:
+    build: .
+    volumes:
+      - .:/app
+      - ./downloads:/app/downloads
+      - ./session:/app/session
+    env_file:
+      - .env
+    stdin_open: true  # Permite entrada interativa
+    tty: true        # Aloca um pseudo-TTY
+    restart: unless-stopped
