@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Union
 from telethon import TelegramClient, errors
@@ -19,6 +20,7 @@ class TelegramClientImpl(TelegramRepository):
         self.console = Console()
         self.current_channel: Optional[TelethonChannel] = None
         self.current_input_peer: Optional[InputPeerChannel] = None
+        self.download_task: Optional[asyncio.Task] = None
         
     async def connect(self) -> bool:
         await self.client.start()
@@ -151,24 +153,72 @@ class TelegramClientImpl(TelegramRepository):
                 
             message = messages[0]
             
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-                TimeRemainingColumn()
-            ) as progress:
-                task = progress.add_task(f"[cyan]Downloading {content.title or f'Content {content.id}'}...", total=100)
+            try:
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TaskProgressColumn(),
+                    TimeRemainingColumn()
+                ) as progress:
+                    task = progress.add_task(f"[cyan]Downloading {content.title or f'Content {content.id}'}...", total=100)
+                    
+                    def progress_callback(current, total):
+                        try:
+                            if total:
+                                progress.update(task, completed=(current * 100 / total))
+                        except Exception:
+                            pass  # Ignore progress updates after cancellation
+                    
+                    # Create download task
+                    self.download_task = asyncio.create_task(
+                        self.client.download_media(message, file_path, progress_callback=progress_callback)
+                    )
+                    
+                    try:
+                        await self.download_task
+                    except asyncio.CancelledError:
+                        self.console.print("\n[yellow]Download cancelled[/yellow]")
+                        # Clean up partial download
+                        try:
+                            if os.path.exists(file_path):
+                                os.remove(file_path)
+                        except Exception:
+                            pass
+                        return False
+                    finally:
+                        self.download_task = None
+                        
+                return True
                 
-                def progress_callback(current, total):
-                    progress.update(task, completed=(current * 100 / total))
+            except Exception as e:
+                self.console.print(f"\n[red]Download error: {str(e)}[/red]")
+                return False
                 
-                await self.client.download_media(message, file_path, progress_callback=progress_callback)
-                
-            return True
         except Exception as e:
             self.console.print(f"[red]Error downloading: {str(e)}[/red]")
             return False
+            
+    async def cancel_download(self):
+        """Cancel the current download if any"""
+        if self.download_task and not self.download_task.done():
+            self.download_task.cancel()
+            try:
+                await self.download_task
+            except asyncio.CancelledError:
+                pass
+            finally:
+                self.download_task = None
+        
+    async def cleanup(self):
+        """Cleanup resources before shutdown"""
+        await self.cancel_download()
+        if self.client:
+            try:
+                if self.client.is_connected():
+                    await self.client.disconnect()
+            except Exception:
+                pass
             
     def _download_progress(self, current: int, total: int):
         """Show download progress"""

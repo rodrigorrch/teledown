@@ -66,17 +66,17 @@ class TeleDownCLI:
                     await self._process_channel(channel_url)
                     
                 except (EOFError, KeyboardInterrupt):
+                    await self.telegram_client.cancel_download()
                     break
                 except Exception as e:
                     self.console.print(f"[red]Error: {str(e)}[/red]")
                     
         finally:
             try:
-                if self.telegram_client.client and self.telegram_client.client.is_connected():
-                    await self.telegram_client.client.disconnect()
-                    self.console.print("[yellow]Disconnected from Telegram[/yellow]")
+                await self.telegram_client.cleanup()
+                self.console.print("[yellow]Disconnected from Telegram[/yellow]")
             except Exception as e:
-                self.console.print(f"[red]Error during disconnect: {str(e)}[/red]")
+                self.console.print(f"[red]Error during cleanup: {str(e)}[/red]")
                 
     async def _process_channel(self, channel_url: str):
         """Process a channel URL and handle content download"""
@@ -166,14 +166,18 @@ def main():
     """Entry point for the CLI application"""
     cli = TeleDownCLI()
     
-    def signal_handler(sig, frame):
-        """Handle termination signals"""
+    async def cleanup_and_exit(sig):
+        """Handle termination signals with async cleanup"""
         cli.console.print("\n[yellow]Shutting down gracefully...[/yellow]")
+        try:
+            await cli.telegram_client.cleanup()
+        except Exception:
+            pass
         sys.exit(0)
         
     # Set up signal handlers
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        asyncio.get_event_loop().add_signal_handler(sig, lambda s=sig: asyncio.create_task(cleanup_and_exit(s)))
     
     # Set up event loop
     try:
@@ -185,6 +189,10 @@ def main():
         cli.console.print(f"[red]Fatal error: {str(e)}[/red]")
     finally:
         try:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             loop.close()
-        except:
+        except Exception:
             pass
